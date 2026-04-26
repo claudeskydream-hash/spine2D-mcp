@@ -5,7 +5,7 @@ import uuid
 from typing import Dict, List, Any, Optional, Tuple
 import logging
 from psd_tools import PSDImage
-from psd_tools.constants import LayerFlags
+
 from PIL import Image
 
 logger = logging.getLogger("spine2d-mcp.psd_parser")
@@ -26,29 +26,27 @@ class PsdParser:
     def parse_psd(self, file_path: str) -> Dict[str, Any]:
         """Parse a PSD file and extract layers"""
         try:
-            # Validate input
             if not os.path.isfile(file_path):
                 raise FileNotFoundError(f"PSD file not found: {file_path}")
-            
+
             if not file_path.lower().endswith(".psd"):
                 raise ValueError(f"File is not a PSD: {file_path}")
-            
-            # Generate character ID
+
             base_name = os.path.basename(file_path)
             character_id = f"char_{str(uuid.uuid4())[:8]}_{base_name.replace('.psd', '')}"
             character_dir = os.path.join(self.characters_dir, character_id)
             os.makedirs(character_dir, exist_ok=True)
-            
-            # Load PSD file
+
+            logger.info("[parse_psd] Opening PSD file...")
             psd = PSDImage.open(file_path)
-            
-            # Extract basic information
+            logger.info(f"[parse_psd] PSD opened: {psd.width}x{psd.height}")
+
             width, height = psd.width, psd.height
-            
-            # Process layers
+
+            logger.info("[parse_psd] Processing layers...")
             layers_info = self._process_layers(psd, character_dir)
-            
-            # Save metadata
+            logger.info(f"[parse_psd] Layers processed: {len(layers_info)}")
+
             metadata = {
                 "character_id": character_id,
                 "original_file": os.path.basename(file_path),
@@ -57,15 +55,16 @@ class PsdParser:
                 "layers": layers_info,
                 "imported_at": self._get_timestamp()
             }
-            
+
             self._save_metadata(character_dir, metadata)
-            
+            logger.info("[parse_psd] Done")
+
             return {
                 "character_id": character_id,
                 "dimensions": {"width": width, "height": height},
                 "layers_count": len(layers_info)
             }
-            
+
         except Exception as e:
             logger.error(f"Error parsing PSD file {file_path}: {e}")
             raise
@@ -73,56 +72,50 @@ class PsdParser:
     def _process_layers(self, psd: PSDImage, output_dir: str, parent_path: str = "") -> List[Dict[str, Any]]:
         """Process layers in the PSD file"""
         layers_info = []
-        
-        # Process layers in reverse order (bottom to top)
+
         for i, layer in enumerate(reversed(psd)):
-            # Skip hidden layers
-            if layer.is_hidden():
+            if not layer.is_visible():
                 continue
-            
+
             layer_name = layer.name
             layer_id = f"layer_{i}"
-            
-            # Build the layer path
             current_path = f"{parent_path}/{layer_name}" if parent_path else layer_name
-            
+
             if layer.is_group():
-                # Process group layers recursively
+                logger.info(f"[layer] Group: {layer_name}")
                 sublayers = self._process_layers(layer, output_dir, current_path)
-                
                 layers_info.append({
                     "id": layer_id,
                     "name": layer_name,
                     "type": "group",
                     "path": current_path,
-                    "visible": not layer.is_hidden(),
+                    "visible": layer.is_visible(),
                     "children": sublayers
                 })
             else:
-                # Process pixel layer
+                logger.info(f"[layer] Pixel: {layer_name}")
                 layer_image_path = self._save_layer_image(layer, output_dir, layer_id)
-                
-                # Get layer bounds
+
                 if layer.has_pixels():
                     left, top, right, bottom = layer.bbox
                     width = right - left
                     height = bottom - top
                 else:
                     left, top, width, height = 0, 0, 0, 0
-                
+
                 layers_info.append({
                     "id": layer_id,
                     "name": layer_name,
                     "type": "pixel",
                     "path": current_path,
-                    "visible": not layer.is_hidden(),
+                    "visible": layer.is_visible(),
                     "position": {"x": left, "y": top},
                     "dimensions": {"width": width, "height": height},
                     "opacity": layer.opacity / 255.0 if hasattr(layer, "opacity") else 1.0,
                     "blend_mode": str(layer.blend_mode) if hasattr(layer, "blend_mode") else "normal",
                     "image_path": os.path.basename(layer_image_path) if layer_image_path else None
                 })
-        
+
         return layers_info
     
     def _save_layer_image(self, layer, output_dir: str, layer_id: str) -> Optional[str]:
@@ -130,19 +123,16 @@ class PsdParser:
         try:
             if not layer.has_pixels():
                 return None
-            
-            # Extract layer image
-            layer_image = layer.composite()
+
+            logger.info(f"[save] Extracting {layer_id}: {layer.name}")
+            layer_image = layer.topil()
             if layer_image is None:
                 return None
-            
-            # Save image
+
             image_filename = f"{layer_id}.png"
             image_path = os.path.join(output_dir, image_filename)
-            
-            # Save with transparency
             layer_image.save(image_path, "PNG")
-            
+            logger.info(f"[save] Saved {layer_id}.png")
             return image_path
         except Exception as e:
             logger.warning(f"Failed to save layer image: {e}")

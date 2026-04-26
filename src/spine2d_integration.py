@@ -2,6 +2,7 @@
 import os
 import json
 import uuid
+import shutil
 from typing import Dict, List, Any, Optional, Tuple
 import logging
 from datetime import datetime
@@ -26,7 +27,7 @@ class Spine2DIntegration:
     def rig_character(self, character_id: str) -> Dict[str, Any]:
         """Create a SPINE2D rig for a character"""
         try:
-            from .psd_parser import PsdParser
+            from psd_parser import PsdParser
             
             # Get character metadata
             parser = PsdParser(self.storage_dir)
@@ -80,9 +81,9 @@ class Spine2DIntegration:
                 "ik_count": len(ik_constraints),
                 "created_at": self._get_timestamp()
             }
-            
+
             self._save_rig_data(rig_dir, spine_project, rig_metadata)
-            
+
             return {
                 "rig_id": rig_id,
                 "bone_count": len(skeleton["bones"]),
@@ -95,49 +96,67 @@ class Spine2DIntegration:
     
     def _analyze_character_structure(self, layers: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Analyze character layers to determine structure"""
-        # This is a simplified implementation
-        # In a real implementation, we would use image analysis to detect parts
-        
         rig_data = {
-            "parts": {},
+            "bones": {},
+            "layer_slots": [],
             "hierarchy": {}
         }
-        
-        # Define common body part names to look for
-        body_parts = {
-            "head": ["head", "face", "hair"],
-            "body": ["body", "torso", "chest"],
-            "arm_right": ["arm_right", "right_arm", "rightarm"],
-            "arm_left": ["arm_left", "left_arm", "leftarm"],
-            "hand_right": ["hand_right", "right_hand", "righthand"],
+
+        # Expanded keyword matching for bone assignment
+        bone_keywords = {
+            "hair": ["hair", "bang", "ponytail"],
+            "eyebrow": ["eyebrow", "brow"],
+            "eye": ["eye", "iris", "irides", "eyewhite", "pupil", "eyelash"],
+            "head": ["head", "face"],
+            "neck": ["neck", "collar"],
+            "headwear": ["headwear", "hat", "cap", "helmet"],
+            "body": ["body", "torso", "chest", "shirt", "jacket", "clothes", "topwear"],
+            "arm_left": ["arm_left", "left_arm", "leftarm", "sleeve_l", "handwear-l", "handwear_l"],
+            "arm_right": ["arm_right", "right_arm", "rightarm", "sleeve_r", "handwear-r", "handwear_r"],
             "hand_left": ["hand_left", "left_hand", "lefthand"],
-            "leg_right": ["leg_right", "right_leg", "rightleg"],
+            "hand_right": ["hand_right", "right_hand", "righthand"],
             "leg_left": ["leg_left", "left_leg", "leftleg"],
+            "leg_right": ["leg_right", "right_leg", "rightleg"],
+            "foot_left": ["foot_left", "left_foot", "leftfoot"],
             "foot_right": ["foot_right", "right_foot", "rightfoot"],
-            "foot_left": ["foot_left", "left_foot", "leftfoot"]
+            "bottomwear": ["bottomwear", "pants", "skirt", "shorts", "legwear"],
+            "objects": ["objects", "weapon", "prop", "item"],
         }
-        
-        # Find layers matching body parts
-        for layer in self._flatten_layers(layers):
-            layer_name = layer["name"].lower()
-            
-            for part_key, part_names in body_parts.items():
-                if any(part_name in layer_name for part_name in part_names):
-                    rig_data["parts"][part_key] = layer
-                    break
-        
-        # Define hierarchy relationships
+
         hierarchy = {
-            "root": ["body"],
-            "body": ["head", "arm_left", "arm_right", "leg_left", "leg_right"],
+            "root": ["body", "bottomwear", "objects"],
+            "body": ["head", "neck", "headwear", "arm_left", "arm_right", "leg_left", "leg_right"],
+            "head": ["hair", "eyebrow", "eye"],
             "arm_left": ["hand_left"],
             "arm_right": ["hand_right"],
             "leg_left": ["foot_left"],
             "leg_right": ["foot_right"]
         }
-        
+
+        flat_layers = self._flatten_layers(layers)
+
+        for layer in flat_layers:
+            layer_name = layer["name"].lower().replace("-", " ").replace("_", " ")
+            matched_bone = None
+
+            for bone_name, keywords in bone_keywords.items():
+                if any(kw in layer_name for kw in keywords):
+                    matched_bone = bone_name
+                    break
+
+            if matched_bone is None:
+                matched_bone = "body"
+
+            # First matching layer provides bone position
+            if matched_bone not in rig_data["bones"]:
+                rig_data["bones"][matched_bone] = layer
+
+            rig_data["layer_slots"].append({
+                "layer": layer,
+                "bone": matched_bone
+            })
+
         rig_data["hierarchy"] = hierarchy
-        
         return rig_data
     
     def _flatten_layers(self, layers: List[Dict[str, Any]], parent_path: str = "") -> List[Dict[str, Any]]:
@@ -159,87 +178,77 @@ class Spine2DIntegration:
         """Create SPINE2D skeleton from rig data"""
         bones = []
         slots = []
-        
-        # Create root bone
-        bones.append({
-            "name": "root",
-            "x": dimensions["width"] / 2,
-            "y": dimensions["height"] / 2,
-            "length": 50
-        })
-        
-        # Create bones for each part
-        for part_name, layer in rig_data["parts"].items():
-            if "position" in layer:
-                x = layer["position"]["x"] + layer["dimensions"]["width"] / 2
-                y = dimensions["height"] - layer["position"]["y"] - layer["dimensions"]["height"] / 2
-            else:
-                x = dimensions["width"] / 2
-                y = dimensions["height"] / 2
-            
-            # Find parent
+        cx = dimensions["width"] / 2
+        cy = dimensions["height"] / 2
+
+        # Root bone at canvas center
+        bones.append({"name": "root", "x": cx, "y": cy, "length": 50})
+
+        # Create bones for matched body parts
+        for bone_name, layer in rig_data["bones"].items():
             parent = "root"
             for parent_name, children in rig_data["hierarchy"].items():
-                if part_name in children:
+                if bone_name in children:
                     parent = parent_name
                     break
-            
-            bones.append({
-                "name": part_name,
-                "parent": parent,
-                "x": x - dimensions["width"] / 2,  # Relative to parent
-                "y": y - dimensions["height"] / 2,  # Relative to parent
-                "length": max(layer["dimensions"]["width"], layer["dimensions"]["height"]) / 2 if "dimensions" in layer else 50
-            })
-            
-            # Create slot
-            if "image_path" in layer and layer["image_path"]:
+
+            if "position" in layer and "dimensions" in layer:
+                x = layer["position"]["x"] + layer["dimensions"]["width"] / 2 - cx
+                y = cy - layer["position"]["y"] - layer["dimensions"]["height"] / 2
+                length = max(layer["dimensions"]["width"], layer["dimensions"]["height"]) / 2
+            else:
+                x, y, length = 0, 0, 50
+
+            bones.append({"name": bone_name, "parent": parent, "x": x, "y": y, "length": length})
+
+        # Create slots for ALL layers in draw order
+        bone_names = {b["name"] for b in bones}
+        for slot_info in rig_data["layer_slots"]:
+            layer = slot_info["layer"]
+            bone = slot_info["bone"]
+            if bone not in bone_names:
+                bone = "root"
+
+            if layer.get("image_path"):
+                attachment_name = layer["image_path"].replace(".png", "")
                 slots.append({
-                    "name": f"slot_{part_name}",
-                    "bone": part_name,
-                    "attachment": layer["image_path"].replace(".png", "")
+                    "name": f"slot_{layer['id']}",
+                    "bone": bone,
+                    "attachment": attachment_name
                 })
-        
-        return {
-            "bones": bones,
-            "slots": slots
-        }
+
+        return {"bones": bones, "slots": slots}
     
     def _create_skin(self, rig_data: Dict[str, Any], character_id: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
-        """Create skin attachments"""
+        """Create skin attachments for ALL layers"""
         skin = {}
-        
-        # Create attachments for each part
-        for part_name, layer in rig_data["parts"].items():
-            if "image_path" in layer and layer["image_path"]:
-                slot_name = f"slot_{part_name}"
+
+        for slot_info in rig_data["layer_slots"]:
+            layer = slot_info["layer"]
+            if layer.get("image_path"):
+                slot_name = f"slot_{layer['id']}"
                 attachment_name = layer["image_path"].replace(".png", "")
-                
-                # Calculate attachment position
-                if "dimensions" in layer:
-                    width = layer["dimensions"]["width"]
-                    height = layer["dimensions"]["height"]
-                else:
-                    width = height = 100  # Default
-                
+                w = layer.get("dimensions", {}).get("width", 100)
+                h = layer.get("dimensions", {}).get("height", 100)
+
                 skin[slot_name] = {
                     attachment_name: {
                         "x": 0,
                         "y": 0,
-                        "width": width,
-                        "height": height,
+                        "width": w,
+                        "height": h,
                         "path": layer["image_path"]
                     }
                 }
-        
+
         return skin
     
     def _create_ik_constraints(self, rig_data: Dict[str, Any], skeleton: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Create IK constraints for the skeleton"""
         ik_constraints = []
-        
-        # Add arm IK
-        if "arm_right" in rig_data["parts"] and "hand_right" in rig_data["parts"]:
+        bones = rig_data.get("bones", {})
+
+        if "arm_right" in bones and "hand_right" in bones:
             ik_constraints.append({
                 "name": "arm_right_ik",
                 "target": "hand_right",
@@ -247,8 +256,8 @@ class Spine2DIntegration:
                 "mix": 1,
                 "bendPositive": True
             })
-        
-        if "arm_left" in rig_data["parts"] and "hand_left" in rig_data["parts"]:
+
+        if "arm_left" in bones and "hand_left" in bones:
             ik_constraints.append({
                 "name": "arm_left_ik",
                 "target": "hand_left",
@@ -256,9 +265,8 @@ class Spine2DIntegration:
                 "mix": 1,
                 "bendPositive": False
             })
-        
-        # Add leg IK
-        if "leg_right" in rig_data["parts"] and "foot_right" in rig_data["parts"]:
+
+        if "leg_right" in bones and "foot_right" in bones:
             ik_constraints.append({
                 "name": "leg_right_ik",
                 "target": "foot_right",
@@ -266,8 +274,8 @@ class Spine2DIntegration:
                 "mix": 1,
                 "bendPositive": False
             })
-        
-        if "leg_left" in rig_data["parts"] and "foot_left" in rig_data["parts"]:
+
+        if "leg_left" in bones and "foot_left" in bones:
             ik_constraints.append({
                 "name": "leg_left_ik",
                 "target": "foot_left",
@@ -275,7 +283,7 @@ class Spine2DIntegration:
                 "mix": 1,
                 "bendPositive": False
             })
-        
+
         return ik_constraints
     
     def _save_rig_data(self, rig_dir: str, spine_project: Dict[str, Any], metadata: Dict[str, Any]):
@@ -293,7 +301,7 @@ class Spine2DIntegration:
     def export_animation(self, character_id: str, animation_id: str, format: str = "json") -> Dict[str, Any]:
         """Export animation to SPINE2D format"""
         try:
-            from .animation_generator import AnimationGenerator
+            from animation_generator import AnimationGenerator
             
             # Get animation data
             generator = AnimationGenerator(self.storage_dir)
@@ -341,9 +349,20 @@ class Spine2DIntegration:
             with open(metadata_path, "w") as f:
                 json.dump(export_metadata, f, indent=2)
             
+            # Copy character images into export directory
+            char_images_src = os.path.join(self.storage_dir, "characters", character_id)
+            char_images_dst = os.path.join(export_dir, "images")
+            if os.path.isdir(char_images_src):
+                if os.path.isdir(char_images_dst):
+                    shutil.rmtree(char_images_dst)
+                shutil.copytree(char_images_src, char_images_dst)
+                # Update images path in spine project to be relative to the JSON file
+                spine_project["skeleton"]["images"] = "images/"
+                logger.info(f"Copied character images to {char_images_dst}")
+
             # Export in requested format
             export_path = ""
-            
+
             if format == "json":
                 export_path = os.path.join(export_dir, f"{animation_name}.json")
                 with open(export_path, "w") as f:
