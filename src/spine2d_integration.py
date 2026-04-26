@@ -174,6 +174,24 @@ class Spine2DIntegration:
         
         return result
     
+    def _topological_sort_bones(self, hierarchy: Dict[str, List[str]], existing_bones: set) -> List[str]:
+        """Sort bones so parents always come before children (topological order)"""
+        sorted_bones = []
+        visited = set()
+
+        def visit(bone):
+            if bone in visited:
+                return
+            visited.add(bone)
+            for child in hierarchy.get(bone, []):
+                if child in existing_bones:
+                    visit(child)
+            sorted_bones.append(bone)
+
+        visit("root")
+        sorted_bones.reverse()
+        return sorted_bones
+
     def _create_skeleton(self, rig_data: Dict[str, Any], dimensions: Dict[str, int]) -> Dict[str, Any]:
         """Create SPINE2D skeleton from rig data"""
         bones = []
@@ -184,8 +202,16 @@ class Spine2DIntegration:
         # Root bone at canvas center
         bones.append({"name": "root", "x": cx, "y": cy, "length": 50})
 
-        # Create bones for matched body parts
-        for bone_name, layer in rig_data["bones"].items():
+        # Sort bones by hierarchy to ensure parents appear before children
+        existing_bones = set(rig_data["bones"].keys())
+        sorted_bone_names = self._topological_sort_bones(rig_data["hierarchy"], existing_bones)
+
+        # Create bones in topological order (skip "root", already added)
+        for bone_name in sorted_bone_names:
+            if bone_name == "root" or bone_name not in existing_bones:
+                continue
+
+            layer = rig_data["bones"][bone_name]
             parent = "root"
             for parent_name, children in rig_data["hierarchy"].items():
                 if bone_name in children:
@@ -326,7 +352,8 @@ class Spine2DIntegration:
             
             # Convert animation data to SPINE2D format
             animation_name = animation_metadata.get("animation_type", "animation")
-            spine_animation = self._convert_to_spine_animation(animation_data)
+            valid_slots = {s["name"] for s in spine_project.get("slots", [])}
+            spine_animation = self._convert_to_spine_animation(animation_data, valid_slots)
             
             # Add animation to SPINE2D project
             spine_project["animations"][animation_name] = spine_animation
@@ -415,63 +442,43 @@ class Spine2DIntegration:
         
         return None
     
-    def _convert_to_spine_animation(self, animation_data: Dict[str, Any]) -> Dict[str, Any]:
+    def _convert_to_spine_animation(self, animation_data: Dict[str, Any], valid_slots: set = None) -> Dict[str, Any]:
         """Convert our animation data to SPINE2D animation format"""
         spine_animation = {
             "bones": {},
-            "slots": {},
-            "deform": {},
-            "drawOrder": [],
-            "events": []
+            "slots": {}
         }
-        
-        # Convert keyframes
+
+        # Convert keyframes (skip non-bone entries like "face")
+        valid_bones = {"root"} | set(animation_data.get("keyframes", {}).keys())
         for bone_name, keyframes in animation_data.get("keyframes", {}).items():
+            if bone_name == "face":
+                continue
             bone_animation = {}
-            
-            # Handle different properties
-            for prop in ["rotate", "translate", "scale"]:
-                bone_animation[prop] = []
-            
+
             for keyframe in keyframes:
                 time = keyframe.get("time", 0)
-                
-                # Handle rotation
+
                 if "rotation" in keyframe:
-                    bone_animation["rotate"].append({
+                    bone_animation.setdefault("rotate", []).append({
                         "time": time,
                         "angle": keyframe["rotation"],
                         "curve": "stepped"
                     })
-                
-                # Handle translation
+
                 if "x" in keyframe or "y" in keyframe:
-                    bone_animation["translate"].append({
+                    bone_animation.setdefault("translate", []).append({
                         "time": time,
                         "x": keyframe.get("x", 0),
                         "y": keyframe.get("y", 0),
                         "curve": "stepped"
                     })
-            
+
             # Only add bone if it has animations
-            if bone_animation["rotate"] or bone_animation["translate"] or bone_animation["scale"]:
+            if bone_animation:
                 spine_animation["bones"][bone_name] = bone_animation
-        
-        # Handle facial expressions as slot attachments
-        if "face" in animation_data.get("keyframes", {}):
-            slot_animation = {
-                "attachment": []
-            }
-            
-            for keyframe in animation_data["keyframes"]["face"]:
-                if "expression" in keyframe:
-                    slot_animation["attachment"].append({
-                        "time": keyframe.get("time", 0),
-                        "name": f"face_{keyframe['expression']}"
-                    })
-            
-            spine_animation["slots"]["slot_face"] = slot_animation
-        
+
+
         # Add particle effects if any
         if "particles" in animation_data:
             event_frames = []
